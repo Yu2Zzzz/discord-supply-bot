@@ -1,5 +1,9 @@
 // index.js
 require('dotenv').config();
+console.log('SUPPLY_LOGIN_URL =', process.env.SUPPLY_LOGIN_URL);
+console.log('BOT_USERNAME =', process.env.BOT_USERNAME);
+// 千万不要打印密码
+// console.log('BOT_PASSWORD =', process.env.BOT_PASSWORD && '***');
 const { Client, GatewayIntentBits } = require('discord.js');
 const axios = require('axios');
 const cron = require('node-cron');

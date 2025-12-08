@@ -222,36 +222,24 @@ client.once('clientReady', () => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  try {
-    if (interaction.commandName === 'ping') {
-      await interaction.reply('pong! 🏓');
-      return;
-    }
+  if (interaction.commandName === 'ping') {
+    await interaction.reply('pong! 🏓');
+    return;
+  }
 
-    if (interaction.commandName === 'report') {
-      // 先告诉 Discord 我在处理，避免 3 秒超时
-      await interaction.deferReply();
-
+  if (interaction.commandName === 'report') {
+    try {
+      await interaction.deferReply(); // 告诉 Discord 正在处理，避免超时
       const report = await generateSupplyReport();
       await interaction.editReply(report);
       console.log('已通过 /report 返回预警报告');
-      return;
-    }
-  } catch (err) {
-    console.error('处理命令失败：', err);
-
-    const errorMsg = '生成报告时出错了，请稍后再试。';
-
-    // 如果之前已经 deferReply 或回复过，就用 editReply
-    if (interaction.deferred || interaction.replied) {
-      await interaction
-        .editReply(errorMsg)
-        .catch((e) => console.error('编辑回复失败：', e));
-    } else if (interaction.isRepliable()) {
-      // 否则就直接 reply 一次
-      await interaction
-        .reply({ content: errorMsg, ephemeral: true })
-        .catch((e) => console.error('回复交互失败：', e));
+    } catch (err) {
+      console.error('处理 /report 失败：', err.message);
+      if (interaction.deferred) {
+        await interaction.editReply('生成报告时出错了，请稍后再试。');
+      } else {
+        await interaction.reply('生成报告时出错了，请稍后再试。');
+      }
     }
   }
 });

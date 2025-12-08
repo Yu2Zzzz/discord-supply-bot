@@ -1,28 +1,19 @@
-// tokenManager.js （CommonJS 写法）
-const path = require('path');
+// tokenManager.js
 const axios = require('axios');
 
-// 强制从和 tokenManager 同目录的 .env 里加载环境变量
-require('dotenv').config({
-  path: path.join(__dirname, '.env'),
-});
+// ⚠️ 临时硬编码配置 —— 确认没问题后再挪回 .env
+const LOGIN_URL = 'https://supply-backend-production.up.railway.app/api/auth/login';
+const BOT_USERNAME = 'discord_bot';
+const BOT_PASSWORD = 'CYmN9m2NkWv7hf8'; // 建议测试通了后改掉密码
 
 let accessToken = null;
 let tokenExpiresAt = 0; // 毫秒时间戳
-
-// 启动时打印一遍，确认环境变量是否读到了
-console.log('[tokenManager] SUPPLY_LOGIN_URL =', process.env.SUPPLY_LOGIN_URL);
-console.log('[tokenManager] BOT_USERNAME =', process.env.BOT_USERNAME);
-// 千万别打印密码
-// console.log('[tokenManager] BOT_PASSWORD =', process.env.BOT_PASSWORD && '***');
 
 function decodeJwtPayload(token) {
   const parts = token.split('.');
   if (parts.length !== 3) throw new Error('Invalid JWT token');
 
   const payload = parts[1];
-
-  // base64url -> base64
   const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
   const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
 
@@ -31,25 +22,21 @@ function decodeJwtPayload(token) {
 }
 
 async function login() {
-  const loginUrl = process.env.SUPPLY_LOGIN_URL;
-  const username = process.env.BOT_USERNAME;
-  const password = process.env.BOT_PASSWORD;
+  console.log('[tokenManager] login() 使用的 loginUrl / username：', LOGIN_URL, BOT_USERNAME);
 
-  console.log('[tokenManager] login() 使用的 loginUrl / username：', loginUrl, username);
-
-  if (!loginUrl || !username || !password) {
-    throw new Error('SUPPLY_LOGIN_URL / BOT_USERNAME / BOT_PASSWORD 未配置完整');
+  if (!LOGIN_URL || !BOT_USERNAME || !BOT_PASSWORD) {
+    throw new Error('LOGIN_URL / BOT_USERNAME / BOT_PASSWORD 配置为空（硬编码版本仍然失败）');
   }
 
   console.log('[BOT] 正在向后端登录获取新的 token …');
 
-  const res = await axios.post(loginUrl, {
-    username,
-    password,
+  const res = await axios.post(LOGIN_URL, {
+    username: BOT_USERNAME,
+    password: BOT_PASSWORD,
   });
 
-  // 根据你的后端返回结构来改：
-  // 假设返回：{ token: "JWT" } 或 { accessToken: "JWT" }
+  // 👇 根据你的后端实际返回调整字段名：
+  // 先假设返回 { token: "JWT" } 或 { accessToken: "JWT" }
   const token = res.data && (res.data.token || res.data.accessToken);
 
   if (!token) {
@@ -64,8 +51,7 @@ async function login() {
     if (payload.exp) {
       tokenExpiresAt = payload.exp * 1000; // exp 是秒
     } else {
-      // 没有 exp 就默认 50 分钟有效
-      tokenExpiresAt = Date.now() + 50 * 60 * 1000;
+      tokenExpiresAt = Date.now() + 50 * 60 * 1000; // 没 exp 默认 50 分钟
     }
 
     console.log(
@@ -79,10 +65,8 @@ async function login() {
   }
 }
 
-// 确保拿到一个未过期的 token（快过期时自动刷新）
 async function ensureToken() {
   const now = Date.now();
-  // 提前 1 分钟刷新
   if (!accessToken || now > tokenExpiresAt - 60 * 1000) {
     await login();
   }
@@ -95,7 +79,6 @@ async function getAuthHeader() {
   };
 }
 
-// 遇到 401 时可以手动重置，强制下次重新登录
 function resetToken() {
   accessToken = null;
   tokenExpiresAt = 0;

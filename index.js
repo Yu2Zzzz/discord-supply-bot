@@ -5,6 +5,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const OpenAI = require('openai');
 const nodemailer = require('nodemailer');
+const { getAuthHeader, resetToken } = require('./tokenManager');
 
 // ========== Groq (OpenAI 兼容接口) ==========
 const groq = new OpenAI({
@@ -53,9 +54,13 @@ const client = new Client({
 // ========== 1. 从 Railway 后端获取预警数据 ==========
 async function fetchSupplyAlerts() {
   try {
+    // 1. 拿 Authorization 头（自动处理登录 & 刷新）
+    const authHeader = await getAuthHeader();
+
+    // 2. 用这个 header 调用你的预警接口
     const res = await axios.get(process.env.SUPPLY_API_URL, {
       headers: {
-        Authorization: process.env.SUPPLY_API_TOKEN,
+        ...authHeader,
       },
     });
 
@@ -97,6 +102,13 @@ async function fetchSupplyAlerts() {
     return alerts;
   } catch (err) {
     console.error('❌ 获取库存预警失败：', err.response?.status, err.message);
+
+    // 如果是 401，重置 token，下次会强制重新登录
+    if (err.response && err.response.status === 401) {
+      console.warn('收到 401，重置本地 token，下次将重新登录');
+      resetToken();
+    }
+
     if (err.response) {
       console.error('响应内容：', JSON.stringify(err.response.data, null, 2));
     }
@@ -179,7 +191,7 @@ ${JSON.stringify(alerts, null, 2)}
 }
 
 // ========== 3. Bot 上线时 ==========
-client.once('clientready', () => {
+client.once('clientReady', () => {
   console.log(`已登录为 ${client.user.tag}`);
 
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件

@@ -1,31 +1,41 @@
-// deploy-commands.js（CommonJS 版本）
+// deploy-commands.js（Guild 版 Slash Commands，立即生效）
 require('dotenv').config();
 const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
-// 定义要注册的全局 Slash 指令
+const APP_ID = process.env.DISCORD_APP_ID;
+const GUILD_ID = process.env.DISCORD_GUILD_ID;
+const TOKEN = process.env.DISCORD_TOKEN;
+
+if (!APP_ID || !GUILD_ID || !TOKEN) {
+  console.error('❌ 请在 .env 中配置 DISCORD_APP_ID / DISCORD_GUILD_ID / DISCORD_TOKEN');
+  process.exit(1);
+}
+
+// 要注册到服务器的 Slash 指令
 const commands = [
   new SlashCommandBuilder()
-    .setName('report')
-    .setDescription('生成并显示当前供应链预警报告'),
-  new SlashCommandBuilder()
     .setName('ping')
-    .setDescription('测试机器人是否在线'),
+    .setDescription('测试 Bot 是否在线'),
+  new SlashCommandBuilder()
+    .setName('report')
+    .setDescription('生成当前供应链库存/交期预警报告'),
 ].map(cmd => cmd.toJSON());
 
-// 使用 Bot Token 初始化 REST 客户端
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 (async () => {
   try {
-    console.log('开始注册 Slash Commands...');
+    console.log('开始向指定服务器注册 Slash Commands...');
+    console.log('APP_ID:', APP_ID);
+    console.log('GUILD_ID:', GUILD_ID);
 
-    // 全局指令：所有加入这个应用的服务器都会有 /report 和 /ping
+    // 只在某个服务器注册（guild commands），几乎秒生效
     await rest.put(
-      Routes.applicationCommands(process.env.DISCORD_APP_ID),
+      Routes.applicationGuildCommands(APP_ID, GUILD_ID),
       { body: commands }
     );
 
-    console.log('✅ Slash Commands 注册成功：/report, /ping');
+    console.log('✅ Slash Commands 注册成功：/ping, /report（Guild 级，立即生效）');
   } catch (error) {
     console.error('❌ 注册失败：', error);
   }

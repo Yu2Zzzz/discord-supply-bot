@@ -4,7 +4,8 @@ console.log('SUPPLY_LOGIN_URL =', process.env.SUPPLY_LOGIN_URL);
 console.log('BOT_USERNAME =', process.env.BOT_USERNAME);
 // 千万不要打印密码
 // console.log('BOT_PASSWORD =', process.env.BOT_PASSWORD && '***');
-const { Client, GatewayIntentBits } = require('discord.js');
+
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const cron = require('node-cron');
 const OpenAI = require('openai');
@@ -54,6 +55,22 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,  // 用于发频道消息
   ],
 });
+
+// ========== 构造库存预警 Embed（带公司专属 Emoji） ==========
+function buildSupplyEmbed(reportText) {
+  // Discord Embed 描述最长 4096 字，做一下安全截断
+  const MAX_DESC = 4000;
+  let desc = reportText || '（报告内容为空）';
+  if (desc.length > MAX_DESC) {
+    desc = desc.slice(0, MAX_DESC) + '\n\n…（内容过长，已截断）';
+  }
+
+  return new EmbedBuilder()
+    .setTitle('<:BHR:1447442981152882793>  每周库存预警报告')
+    .setDescription(desc)
+    .setColor(0x00a2ff)
+    .setTimestamp();
+}
 
 // ========== 1. 从 Railway 后端获取预警数据 ==========
 async function fetchSupplyAlerts() {
@@ -195,7 +212,7 @@ ${JSON.stringify(alerts, null, 2)}
 }
 
 // ========== 3. Bot 上线时 ==========
-client.once('clientReady', () => {
+client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
 
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件
@@ -205,8 +222,9 @@ client.once('clientReady', () => {
 
       if (process.env.DISCORD_CHANNEL_ID) {
         const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
-        await channel.send(report);
-        console.log('已在频道发送每周库存预警报告');
+        const embed = buildSupplyEmbed(report);
+        await channel.send({ embeds: [embed] });
+        console.log('已在频道发送每周库存预警报告（Embed）');
       } else {
         console.log('未配置 DISCORD_CHANNEL_ID，无法在频道发送每周报告');
       }
@@ -231,8 +249,9 @@ client.on('interactionCreate', async (interaction) => {
     try {
       await interaction.deferReply(); // 告诉 Discord 正在处理，避免超时
       const report = await generateSupplyReport();
-      await interaction.editReply(report);
-      console.log('已通过 /report 返回预警报告');
+      const embed = buildSupplyEmbed(report);
+      await interaction.editReply({ embeds: [embed] });
+      console.log('已通过 /report 返回预警报告（Embed）');
     } catch (err) {
       console.error('处理 /report 失败：', err.message);
       if (interaction.deferred) {

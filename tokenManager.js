@@ -1,8 +1,20 @@
 // tokenManager.js （CommonJS 写法）
+const path = require('path');
 const axios = require('axios');
+
+// 强制从和 tokenManager 同目录的 .env 里加载环境变量
+require('dotenv').config({
+  path: path.join(__dirname, '.env'),
+});
 
 let accessToken = null;
 let tokenExpiresAt = 0; // 毫秒时间戳
+
+// 启动时打印一遍，确认环境变量是否读到了
+console.log('[tokenManager] SUPPLY_LOGIN_URL =', process.env.SUPPLY_LOGIN_URL);
+console.log('[tokenManager] BOT_USERNAME =', process.env.BOT_USERNAME);
+// 千万别打印密码
+// console.log('[tokenManager] BOT_PASSWORD =', process.env.BOT_PASSWORD && '***');
 
 function decodeJwtPayload(token) {
   const parts = token.split('.');
@@ -23,6 +35,8 @@ async function login() {
   const username = process.env.BOT_USERNAME;
   const password = process.env.BOT_PASSWORD;
 
+  console.log('[tokenManager] login() 使用的 loginUrl / username：', loginUrl, username);
+
   if (!loginUrl || !username || !password) {
     throw new Error('SUPPLY_LOGIN_URL / BOT_USERNAME / BOT_PASSWORD 未配置完整');
   }
@@ -35,7 +49,7 @@ async function login() {
   });
 
   // 根据你的后端返回结构来改：
-  // 假设返回：{ token: "JWT" }
+  // 假设返回：{ token: "JWT" } 或 { accessToken: "JWT" }
   const token = res.data && (res.data.token || res.data.accessToken);
 
   if (!token) {

@@ -34,7 +34,7 @@ async function sendEmailReport(subject, text) {
       from: `"Supply Bot" <${process.env.EMAIL_USER}>`,
       to: process.env.EMAIL_TO,
       subject,
-      text, // 先用纯文本，有需要再上 html
+      text,
     });
     console.log('📧 已发送邮件报告');
   } catch (err) {
@@ -45,9 +45,8 @@ async function sendEmailReport(subject, text) {
 // ========== Discord 客户端 ==========
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.Guilds,         // 使用 Slash 指令必须要这个
+    GatewayIntentBits.GuildMessages,  // 用于发频道消息
   ],
 });
 
@@ -56,7 +55,7 @@ async function fetchSupplyAlerts() {
   try {
     const res = await axios.get(process.env.SUPPLY_API_URL, {
       headers: {
-        Authorization: process.env.SUPPLY_API_TOKEN, // .env 里带 Bearer
+        Authorization: process.env.SUPPLY_API_TOKEN,
       },
     });
 
@@ -86,12 +85,12 @@ async function fetchSupplyAlerts() {
 
     const alerts = raw.map((item) => ({
       id: item.id,
-      level: item.level,              // RED / ORANGE / YELLOW
-      sku: item.materialCode,         // 物料编码
-      name: item.materialName,        // 物料名称
-      buyer: item.buyer,              // 采购员
-      warningType: item.warningType,  // stock_shortage / delivery_delay
-      message: item.message,          // “库存不足，当前8000，需求45000”
+      level: item.level,
+      sku: item.materialCode,
+      name: item.materialName,
+      buyer: item.buyer,
+      warningType: item.warningType,
+      message: item.message,
       createdAt: item.createdAt,
     }));
 
@@ -113,7 +112,6 @@ async function generateSupplyReport() {
     return '当前没有检测到任何库存或交期预警。';
   }
 
-  // 没配 GROQ_API_KEY 的兜底
   if (!process.env.GROQ_API_KEY) {
     let lines = ['【库存/交期预警（简易版，无 LLM）】'];
     for (const a of alerts) {
@@ -150,20 +148,15 @@ ${JSON.stringify(alerts, null, 2)}
    - 按风险从高到低列出预警物料。
    - 每条包括：level、物料编码、名称、buyer、warningType、简要说明（可参考 message）。
    - 对于 warningType = "stock_shortage" 的条目：
-       - 如果 message 中包含“当前库存、需求量”等数字，请尝试读出来并用自然语言描述，例如：
-         “当前库存约 8000，需求 45000，缺口较大，需要尽快补货”。
+       - 如果 message 中包含“当前库存、需求量”等数字，请尝试读出来并用自然语言描述。
    - 对于 warningType = "delivery_delay" 的条目：
        - 说明可能的影响（订单延误、排产受影响等）。
 
 3. 【行动建议】：
-   - 给出 3 条左右的行动建议，例如：
-       - 哪几条物料需要马上下单 / 催货；
-       - 需要和哪些供应商沟通交期；
-       - 是否需要调整安全库存或排产计划。
+   - 给出 3 条左右的行动建议。
 
 4. 输出格式：
    - 使用 Markdown，以小标题和列表形式展示。
-   - 清晰、偏实战风格，不要太学术。
   `;
 
   try {
@@ -190,12 +183,10 @@ client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
 
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件
-  // cron 表达式: 秒 分 时 日 月 周   → 0 0 9 * * 1 = 周一 9:00
   cron.schedule('0 0 9 * * 1', async () => {
     try {
       const report = await generateSupplyReport();
 
-      // ① 发到固定频道
       if (process.env.DISCORD_CHANNEL_ID) {
         const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
         await channel.send(report);
@@ -204,7 +195,6 @@ client.once('ready', () => {
         console.log('未配置 DISCORD_CHANNEL_ID，无法在频道发送每周报告');
       }
 
-      // ② 发邮件
       await sendEmailReport('每周库存预警报告', report);
     } catch (err) {
       console.error('发送定时报告失败：', err.message);
@@ -212,19 +202,28 @@ client.once('ready', () => {
   });
 });
 
-// ========== 4. 在频道输入 !report 手动触发（只在当前频道回复） ==========
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
+// ========== 4. 处理 Slash 指令：/ping 和 /report ==========
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-  if (message.content.trim() === '!report') {
+  if (interaction.commandName === 'ping') {
+    await interaction.reply('pong! 🏓');
+    return;
+  }
+
+  if (interaction.commandName === 'report') {
     try {
+      await interaction.deferReply(); // 告诉 Discord 正在处理，避免超时
       const report = await generateSupplyReport();
-      // 直接在当前频道发送报告，不再私信
-      await message.channel.send(report);
-      console.log('已在频道响应手动 !report 请求');
+      await interaction.editReply(report);
+      console.log('已通过 /report 返回预警报告');
     } catch (err) {
-      console.error('发送手动报告失败：', err.message);
-      await message.channel.send('发送报告时出错了，请检查机器人配置。');
+      console.error('处理 /report 失败：', err.message);
+      if (interaction.deferred) {
+        await interaction.editReply('生成报告时出错了，请稍后再试。');
+      } else {
+        await interaction.reply('生成报告时出错了，请稍后再试。');
+      }
     }
   }
 });

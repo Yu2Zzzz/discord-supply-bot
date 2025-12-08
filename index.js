@@ -179,7 +179,7 @@ ${JSON.stringify(alerts, null, 2)}
 }
 
 // ========== 3. Bot 上线时 ==========
-client.once('ready', () => {
+client.once('clientready', () => {
   console.log(`已登录为 ${client.user.tag}`);
 
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件

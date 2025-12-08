@@ -37,7 +37,9 @@ async function login() {
 
   // 👇 根据你的后端实际返回调整字段名：
   // 先假设返回 { token: "JWT" } 或 { accessToken: "JWT" }
-  const token = res.data && (res.data.token || res.data.accessToken);
+  const token =
+    (res.data && res.data.data && res.data.data.token) ||
+    (res.data && (res.data.token || res.data.accessToken));
 
   if (!token) {
     console.error('登录响应：', res.data);

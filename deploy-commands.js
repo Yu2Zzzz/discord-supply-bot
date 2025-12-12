@@ -19,6 +19,24 @@ const commands = [
   new SlashCommandBuilder()
     .setName('report')
     .setDescription('生成供应链全站深度报告（预警/订单/库存）'),
+  new SlashCommandBuilder()
+    .setName('import-suppliers')
+    .setDescription('批量导入供应商（上传 Excel）')
+    .addAttachmentOption(option =>
+      option
+        .setName('file')
+        .setDescription('Excel 文件，需包含供应商编码、名称等列')
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName('import-materials')
+    .setDescription('批量导入物料（上传 Excel）')
+    .addAttachmentOption(option =>
+      option
+        .setName('file')
+        .setDescription('Excel 文件，需包含物料编码、名称等列')
+        .setRequired(true)
+    ),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);

@@ -10,6 +10,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const OpenAI = require('openai');
 const nodemailer = require('nodemailer');
+const XLSX = require('xlsx');
 const { getAuthHeader, resetToken } = require('./tokenManager');
 
 // ========== Groq (OpenAI 兼容接口) ==========
@@ -23,6 +24,45 @@ function resolveDataUrl() {
   if (process.env.SUPPLY_DATA_URL) return process.env.SUPPLY_DATA_URL;
   if (process.env.SUPPLY_API_URL) {
     return process.env.SUPPLY_API_URL.replace(/warnings(\?.*)?$/i, 'data');
+  }
+  return null;
+}
+
+// 推断 API 基础地址，用于调用 /suppliers
+function resolveApiBase() {
+  if (process.env.SUPPLY_BASE_URL) {
+    return process.env.SUPPLY_BASE_URL
+      .replace(/\/api\/api$/i, '/api')
+      .replace(/\/api\/$/i, '/api')
+      .replace(/\/$/, '');
+  }
+  if (process.env.SUPPLY_API_URL) {
+    try {
+      const u = new URL(process.env.SUPPLY_API_URL);
+      // 将 /api/warnings → /api
+      u.pathname = u.pathname.replace(/\/warnings.*/i, '/api');
+      return u
+        .toString()
+        .replace(/\/api\/api$/i, '/api')
+        .replace(/\/api\/$/i, '/api')
+        .replace(/\/$/, '');
+    } catch (e) {
+      return null;
+    }
+  }
+  if (process.env.SUPPLY_LOGIN_URL) {
+    try {
+      const u = new URL(process.env.SUPPLY_LOGIN_URL);
+      // 将 /api/auth/login → /api
+      u.pathname = u.pathname.replace(/\/auth\/login.*/i, '/api');
+      return u
+        .toString()
+        .replace(/\/api\/api$/i, '/api')
+        .replace(/\/api\/$/i, '/api')
+        .replace(/\/$/, '');
+    } catch (e) {
+      return null;
+    }
   }
   return null;
 }
@@ -280,10 +320,273 @@ ${JSON.stringify(safeAlerts, null, 2)}
   }
 }
 
+// ========== 2.1 从 Excel 附件批量导入供应商 ==========
+function normalizeSupplierRow(row = {}) {
+  const aliases = {
+    supplierCode: ['suppliercode', 'supplier_code', 'code', '编码', '供应商编码'],
+    name: ['name', '供应商名称', '供应商'],
+    category: ['category', '类目'],
+    productName: ['productname', 'product_name', '品名', '产品名', '产品'],
+    unitPrice: ['unitprice', 'unit_price', '单价', '价格'],
+    paymentMethod: ['paymentmethod', 'payment_method', '付款方式', '支付方式'],
+    contactPerson: ['contactperson', 'contact_person', '联系人'],
+    phone: ['phone', '电话', '手机号', 'mobile'],
+    email: ['email', '邮箱', 'mail'],
+    address: ['address', '地址'],
+    onTimeRate: ['ontimerate', 'on_time_rate', '准时率', '及时率'],
+    qualityRate: ['qualityrate', 'quality_rate', '质量率', '合格率'],
+    remark: ['remark', '备注'],
+    status: ['status', '状态'],
+  };
+
+  const lowerRow = {};
+  for (const [k, v] of Object.entries(row)) {
+    lowerRow[String(k).toLowerCase().trim()] = v;
+  }
+
+  const result = {};
+  for (const [target, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (lowerRow[key] !== undefined && lowerRow[key] !== null && lowerRow[key] !== '') {
+        result[target] = lowerRow[key];
+        break;
+      }
+    }
+  }
+
+  if (result.unitPrice !== undefined) {
+    const num = Number(result.unitPrice);
+    result.unitPrice = Number.isFinite(num) ? num : null;
+  }
+  if (result.onTimeRate !== undefined) {
+    const num = Number(result.onTimeRate);
+    result.onTimeRate = Number.isFinite(num) ? num : undefined;
+  }
+  if (result.qualityRate !== undefined) {
+    const num = Number(result.qualityRate);
+    result.qualityRate = Number.isFinite(num) ? num : undefined;
+  }
+
+  return result;
+}
+
+async function importSuppliersFromExcel(attachmentUrl) {
+  const apiBase = resolveApiBase();
+  if (!apiBase) {
+    throw new Error('无法推断后端 API 基础地址，请配置 SUPPLY_BASE_URL 或 SUPPLY_API_URL');
+  }
+
+  // 下载文件
+  const fileRes = await axios.get(attachmentUrl, { responseType: 'arraybuffer' });
+  const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error('Excel 文件没有工作表');
+
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+  if (!rows.length) throw new Error('Excel 中没有数据行');
+
+  const candidates = rows.map(normalizeSupplierRow).filter(r => r.supplierCode && r.name);
+  if (!candidates.length) {
+    throw new Error('未找到包含供应商编码与名称的有效行，请确认表头/列名');
+  }
+
+  const authHeader = await getAuthHeader();
+  const summary = {
+    total: candidates.length,
+    success: 0,
+    failed: 0,
+    messages: [],
+  };
+
+  for (const item of candidates) {
+    try {
+      await axios.post(`${apiBase}/suppliers`, {
+        supplierCode: item.supplierCode,
+        name: item.name,
+        category: item.category || null,
+        productName: item.productName || null,
+        unitPrice: item.unitPrice || null,
+        paymentMethod: item.paymentMethod || null,
+        contactPerson: item.contactPerson || null,
+        phone: item.phone || null,
+        email: item.email || null,
+        address: item.address || null,
+        onTimeRate: item.onTimeRate,
+        qualityRate: item.qualityRate,
+        remark: item.remark || null,
+        status: item.status || 'active',
+      }, {
+        headers: {
+          ...authHeader,
+        },
+      });
+      summary.success += 1;
+      summary.messages.push(`✅ ${item.supplierCode} ${item.name}`);
+    } catch (err) {
+      summary.failed += 1;
+      const msg = err.response?.data?.message || err.message;
+      summary.messages.push(`❌ ${item.supplierCode || ''} ${item.name || ''} -> ${msg}`);
+      if (err.response && err.response.status === 401) {
+        resetToken();
+      }
+    }
+  }
+
+  return summary;
+}
+
+// ========== 2.2 从 Excel 附件批量导入物料 ==========
+function normalizeMaterialRow(row = {}) {
+  const aliases = {
+    materialCode: ['materialcode', 'material_code', 'code', '编码', '物料编码', 'sku'],
+    name: ['name', '物料名称', '品名'],
+    spec: ['spec', '规格'],
+    unit: ['unit', '单位'],
+    price: ['price', '单价'],
+    safeStock: ['safestock', 'safe_stock', '安全库存', '安全量'],
+    leadTime: ['leadtime', 'lead_time', '交期', '周期'],
+    buyer: ['buyer', 'purchaser', '采购员', '采购人'],
+    category: ['category', '类目'],
+    status: ['status', '状态'],
+  };
+
+  const lowerRow = {};
+  for (const [k, v] of Object.entries(row)) {
+    lowerRow[String(k).toLowerCase().trim()] = v;
+  }
+
+  const result = {};
+  for (const [target, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (lowerRow[key] !== undefined && lowerRow[key] !== null && lowerRow[key] !== '') {
+        result[target] = lowerRow[key];
+        break;
+      }
+    }
+  }
+
+  if (result.price !== undefined) {
+    const num = Number(result.price);
+    result.price = Number.isFinite(num) ? num : null;
+  }
+  if (result.safeStock !== undefined) {
+    const num = Number(result.safeStock);
+    result.safeStock = Number.isFinite(num) ? num : undefined;
+  }
+  if (result.leadTime !== undefined) {
+    const num = Number(result.leadTime);
+    result.leadTime = Number.isFinite(num) ? num : undefined;
+  }
+
+  return result;
+}
+
+async function importMaterialsFromExcel(attachmentUrl) {
+  const apiBase = resolveApiBase();
+  if (!apiBase) {
+    throw new Error('无法推断后端 API 基础地址，请配置 SUPPLY_BASE_URL 或 SUPPLY_API_URL');
+  }
+
+  const fileRes = await axios.get(attachmentUrl, { responseType: 'arraybuffer' });
+  const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error('Excel 文件没有工作表');
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+  if (!rows.length) throw new Error('Excel 中没有数据行');
+
+  const candidates = rows.map(normalizeMaterialRow).filter(r => r.materialCode && r.name);
+  if (!candidates.length) throw new Error('未找到包含物料编码与名称的有效行，请确认表头/列名');
+
+  const authHeader = await getAuthHeader();
+  const summary = { total: candidates.length, success: 0, failed: 0, messages: [] };
+
+  for (const item of candidates) {
+    try {
+      await axios.post(`${apiBase}/materials`, {
+        materialCode: item.materialCode,
+        name: item.name,
+        spec: item.spec || null,
+        unit: item.unit || 'PCS',
+        price: item.price ?? null,
+        safeStock: item.safeStock,
+        leadTime: item.leadTime,
+        buyer: item.buyer || item.purchaser || null,
+        category: item.category || null,
+        status: item.status || 'active',
+      }, { headers: { ...authHeader } });
+
+      summary.success += 1;
+      summary.messages.push(`✅ ${item.materialCode} ${item.name}`);
+    } catch (err) {
+      summary.failed += 1;
+      const msg = err.response?.data?.message || err.message;
+      summary.messages.push(`❌ ${item.materialCode || ''} ${item.name || ''} -> ${msg}`);
+      if (err.response && err.response.status === 401) resetToken();
+    }
+  }
+
+  return summary;
+}
+
 // ========== 3. Bot 上线时 ==========
 client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
 
+  // 临时：在“表单格式”频道发送导入说明与模板（发送一次后可置顶并删除此块）
+  (async () => {
+    const FORM_CHANNEL_NAME = '表单格式'; // 目标频道名称
+    const FORM_CHANNEL_ID = process.env.FORM_CHANNEL_ID; // 可选，指定频道 ID 更稳
+    const materialTemplatePath = 'sample-materials.xlsx';
+    const supplierTemplatePath = 'sample-suppliers.xlsx';
+
+    try {
+      let targetChannel = null;
+
+      // 1) 优先用 env 指定的频道 ID
+      if (FORM_CHANNEL_ID) {
+        try {
+          const ch = await client.channels.fetch(FORM_CHANNEL_ID);
+          if (ch && ch.isTextBased && ch.isTextBased()) {
+            targetChannel = ch;
+          }
+        } catch (e) {
+          console.warn('按 FORM_CHANNEL_ID 获取频道失败：', e.message);
+        }
+      }
+
+      // 2) 否则遍历缓存按名称查找
+      if (!targetChannel) {
+        client.channels.cache.forEach((ch) => {
+          if (ch && ch.name === FORM_CHANNEL_NAME && ch.isTextBased && ch.isTextBased()) {
+            targetChannel = ch;
+          }
+        });
+      }
+
+      if (!targetChannel) {
+        console.warn(`未找到名为「${FORM_CHANNEL_NAME}」的频道，跳过发送模板消息`);
+        return;
+      }
+
+      const content =
+        'Excel 导入说明（/import-materials 与 /import-suppliers）：\n\n' +
+        '物料导入：必填 物料编码、物料名称；可选 规格、单位、单价、安全库存、交期、采购员、类目、状态。\n' +
+        '供应商导入：必填 供应商编码、供应商名称；可选 类目、付款方式、联系人、电话、邮箱、地址、状态。\n' +
+        '请确保文件为 Excel（xlsx），数据在首个工作表，表头包含必填列。';
+
+      await targetChannel.send({
+        content,
+        files: [materialTemplatePath, supplierTemplatePath],
+      });
+
+      console.log(`已在「${FORM_CHANNEL_NAME}」频道发送导入格式与模板`);
+    } catch (e) {
+      console.error('发送导入模板消息失败：', e.message);
+    }
+  })();
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件
   cron.schedule('0 0 9 * * 1', async () => {
     try {
@@ -327,6 +630,68 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply('生成报告时出错了，请稍后再试。');
       } else {
         await interaction.reply('生成报告时出错了，请稍后再试。');
+      }
+    }
+  }
+
+  if (interaction.commandName === 'import-suppliers') {
+    const attachment = interaction.options.getAttachment('file');
+    if (!attachment) {
+      await interaction.reply({ content: '请上传 Excel 文件（包含供应商编码与名称）', ephemeral: true });
+      return;
+    }
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      const summary = await importSuppliersFromExcel(attachment.url);
+      const lines = [
+        `导入完成：成功 ${summary.success} 条，失败 ${summary.failed} 条，合计 ${summary.total} 条。`,
+      ];
+      for (const msg of summary.messages.slice(0, 20)) {
+        lines.push(msg);
+      }
+      if (summary.messages.length > 20) {
+        lines.push(`… 其余 ${summary.messages.length - 20} 条已省略`);
+      }
+      await interaction.editReply(lines.join('\n'));
+      console.log('已完成 Excel 批量导入供应商');
+    } catch (err) {
+      console.error('处理 /import-suppliers 失败：', err.message);
+      const content = `导入失败：${err.message || '未知错误'}`;
+      if (interaction.deferred) {
+        await interaction.editReply(content);
+      } else {
+        await interaction.reply({ content, ephemeral: true });
+      }
+    }
+  }
+
+  if (interaction.commandName === 'import-materials') {
+    const attachment = interaction.options.getAttachment('file');
+    if (!attachment) {
+      await interaction.reply({ content: '请上传 Excel 文件（包含物料编码与名称）', ephemeral: true });
+      return;
+    }
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      const summary = await importMaterialsFromExcel(attachment.url);
+      const lines = [
+        `导入完成：成功 ${summary.success} 条，失败 ${summary.failed} 条，合计 ${summary.total} 条。`,
+      ];
+      for (const msg of summary.messages.slice(0, 20)) lines.push(msg);
+      if (summary.messages.length > 20) {
+        lines.push(`… 其余 ${summary.messages.length - 20} 条已省略`);
+      }
+      await interaction.editReply(lines.join('\n'));
+      console.log('已完成 Excel 批量导入物料');
+    } catch (err) {
+      console.error('处理 /import-materials 失败：', err.message);
+      const content = `导入失败：${err.message || '未知错误'}`;
+      if (interaction.deferred) {
+        await interaction.editReply(content);
+      } else {
+        await interaction.reply({ content, ephemeral: true });
       }
     }
   }

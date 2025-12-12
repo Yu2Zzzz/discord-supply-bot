@@ -18,6 +18,15 @@ const groq = new OpenAI({
   baseURL: 'https://api.groq.com/openai/v1',
 });
 
+// 根据配置推断 /data 接口地址（默认把 /warnings 替换成 /data）
+function resolveDataUrl() {
+  if (process.env.SUPPLY_DATA_URL) return process.env.SUPPLY_DATA_URL;
+  if (process.env.SUPPLY_API_URL) {
+    return process.env.SUPPLY_API_URL.replace(/warnings(\?.*)?$/i, 'data');
+  }
+  return null;
+}
+
 // ========== 邮件发送工具 ==========
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -66,7 +75,7 @@ function buildSupplyEmbed(reportText) {
   }
 
   return new EmbedBuilder()
-    .setTitle('<:BHR:1447442981152882793>  每周库存预警报告')
+    .setTitle('<:BHR:1447442981152882793>  供应链深度报告')
     .setDescription(desc)
     .setColor(0x00a2ff)
     .setTimestamp();
@@ -137,65 +146,120 @@ async function fetchSupplyAlerts() {
   }
 }
 
+// ========== 1.1 获取全量业务数据（仪表板 /data） ==========
+async function fetchDashboardData() {
+  const dataUrl = resolveDataUrl();
+  if (!dataUrl) {
+    console.log('未配置 SUPPLY_DATA_URL，且无法从 SUPPLY_API_URL 推断 /data 路径，跳过全量数据抓取');
+    return null;
+  }
+
+  try {
+    const authHeader = await getAuthHeader();
+    const res = await axios.get(dataUrl, {
+      headers: {
+        ...authHeader,
+      },
+    });
+
+    let body = res.data;
+    console.log('全量数据接口 HTTP 状态码：', res.status);
+
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (e) {
+        console.error('解析全量数据 body 字符串为 JSON 失败：', e.message);
+        return null;
+      }
+    }
+
+    if (!body || typeof body !== 'object') {
+      console.log('⚠ 全量数据接口返回结构异常');
+      return null;
+    }
+
+    const summary = {
+      orders: Array.isArray(body.orders) ? body.orders.length : 0,
+      orderLines: Array.isArray(body.orderLines) ? body.orderLines.length : 0,
+      materials: Array.isArray(body.mats) ? body.mats.length : 0,
+      purchaseOrders: Array.isArray(body.pos) ? body.pos.length : 0,
+      suppliers: Array.isArray(body.suppliers) ? body.suppliers.length : 0,
+      products: Array.isArray(body.products) ? body.products.length : 0,
+      bom: Array.isArray(body.bom) ? body.bom.length : 0,
+    };
+    console.log('全量数据集概览：', summary);
+
+    return { raw: body, summary };
+  } catch (err) {
+    console.error('❌ 获取全量数据失败：', err.response?.status, err.message);
+
+    if (err.response && err.response.status === 401) {
+      console.warn('收到 401，重置本地 token，下次将重新登录');
+      resetToken();
+    }
+
+    if (err.response) {
+      console.error('响应内容：', JSON.stringify(err.response.data, null, 2));
+    }
+    return null;
+  }
+}
+
 // ========== 2. 用 Groq LLM 生成预警报告 ==========
 async function generateSupplyReport() {
-  const alerts = await fetchSupplyAlerts();
+  const [alerts, dashboard] = await Promise.all([
+    fetchSupplyAlerts(),
+    fetchDashboardData(),
+  ]);
 
-  if (!alerts || alerts.length === 0) {
-    return '当前没有检测到任何库存或交期预警。';
-  }
+  const safeAlerts = alerts || [];
+  const fullData = dashboard?.raw || null;
+  const dataSummary = dashboard?.summary || null;
 
   if (!process.env.GROQ_API_KEY) {
     let lines = ['【库存/交期预警（简易版，无 LLM）】'];
-    for (const a of alerts) {
+    if (dataSummary) {
       lines.push(
-        `- [${a.level}] ${a.sku} | ${a.name} | 类型：${a.warningType} | 采购：${a.buyer} | 提示：${a.message}`
+        `- 订单 ${dataSummary.orders} 条 / 行项目 ${dataSummary.orderLines} 条 / 采购单 ${dataSummary.purchaseOrders} 条`,
+        `- 物料 ${dataSummary.materials} 个 / 供应商关系 ${dataSummary.suppliers} 条 / 产品 ${dataSummary.products} 个 / BOM 行 ${dataSummary.bom} 条`
       );
+    } else {
+      lines.push('- 未能获取全量数据接口，已仅使用预警信息。');
     }
-    lines.push('（提示：配置 GROQ_API_KEY 后，将自动生成更智能的采购与行动建议。）');
+
+    if (safeAlerts.length) {
+      for (const a of safeAlerts) {
+        lines.push(
+          `- [${a.level}] ${a.sku} | ${a.name} | 类型：${a.warningType} | 采购：${a.buyer} | 提示：${a.message}`
+        );
+      }
+    } else {
+      lines.push('- 当前没有检测到任何库存或交期预警。');
+    }
+
+    lines.push('（提示：配置 GROQ_API_KEY 后，将自动生成更智能的全站深度解读。）');
     return lines.join('\n');
   }
 
-    const prompt = `
-你是供应链计划员。下面是从系统抓取到的库存/交期预警列表（JSON 数组）：
-${JSON.stringify(alerts, null, 2)}
+  const prompt = `
+你是供应链计划员。下面是从系统抓取到的全站业务数据（JSON 对象）：
+${JSON.stringify(fullData || {}, null, 2)}
 
-字段含义：
-- level: "RED"（高风险）、"ORANGE"（中风险）、"YELLOW"（低风险）
-- sku: 物料编码
-- name: 物料名称
-- buyer: 采购负责人
-- warningType: 
-    - "stock_shortage" = 库存不足 / 低于安全库存
-    - "delivery_delay" = 供应商交期可能延期
-- message: 文本描述，可能包含类似“库存不足，当前8000，需求45000”的信息
-- createdAt: 预警创建时间
+这里是预警列表（JSON 数组，可能为空表示没有预警）：
+${JSON.stringify(safeAlerts, null, 2)}
 
-请你用中文输出一份清晰的供应链预警报告，要求：
-
-1. 总体概览：
-   - 按 level 统计各级别预警数量（高/中/低风险各多少条）。
-   - 简要评估当前供应链整体风险情况。
-
-2. 【需要优先处理的物料清单】：
-   - 按风险从高到低列出预警物料。
-   - 每条包括：level、物料编码、名称、buyer、warningType、简要说明（可参考 message）。
-   - 对于 warningType = "stock_shortage" 的条目：
-       - 如果 message 中包含“当前库存、需求量”等数字，请尝试读出来并用自然语言描述。
-   - 对于 warningType = "delivery_delay" 的条目：
-       - 说明可能的影响（订单延误、排产受影响等）。
-
-3. 【行动建议】：
-   - 给出 3 条左右的行动建议。
-
-4. 输出格式要求（非常重要）：
-   - 只用纯文本，不要使用任何 Markdown 语法；
-   - 不要使用表格，不要输出竖线“|”或加号“+”来画表格；
-   - 不要使用下划线标题（例如在标题下面输出一整行“====”或“----”）；
-   - 不要输出代码块，不要输出反引号 \`；
-   - 可以使用阿拉伯数字序号（例如“1.”、“2.”、“3.”）或短横线（“- ”）列出条目；
-   - 整体风格像一份普通的中文文字报告，而不是 Markdown 或程序代码。
-  `;
+请输出一份“全站深度解读报告”，要求：
+1. 总体概览：订单、物料、采购单、供应商等规模；按预警 level 给出数量。
+2. 库存与采购风险：指出库存低于安全库存、在途量不足、BOM 中关键物料风险，并关联对应采购单或供应商。
+3. 订单交付风险：关注交期临近且存在物料风险或供应商延迟的订单。
+4. 供应商表现：结合 on-time/quality 指标，标出主要供应商及潜在隐患。
+5. BOM/产品：如数据包含 BOM，指出关键物料依赖，提示缺料对产品的影响。
+6. 预警解读：逐条说明高/中风险预警的业务影响。
+7. 行动建议：给出 3-5 条可以直接执行的动作（补货、催交、切换供应商、沟通客户等）。
+8. 口径：如数据缺失请说明，不要编造。
+9. 输出格式（非常重要）：纯中文文本，不要使用 Markdown 语法、表格或反引号；可用数字或短横线列点；控制在 3400 字以内，适合放入 Discord Embed 描述。
+`;
 
   try {
     const completion = await groq.chat.completions.create({
@@ -207,7 +271,7 @@ ${JSON.stringify(alerts, null, 2)}
   } catch (err) {
     console.error('生成 LLM 报告失败：', err.message);
     let lines = ['生成智能报告失败，以下为原始预警数据：'];
-    for (const a of alerts) {
+    for (const a of safeAlerts) {
       lines.push(
         `- [${a.level}] ${a.sku} | ${a.name} | 类型：${a.warningType} | 采购：${a.buyer} | 提示：${a.message}`
       );
@@ -229,12 +293,12 @@ client.once('ready', () => {
         const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
         const embed = buildSupplyEmbed(report);
         await channel.send({ embeds: [embed] });
-        console.log('已在频道发送每周库存预警报告（Embed）');
+        console.log('已在频道发送每周供应链深度报告（Embed）');
       } else {
         console.log('未配置 DISCORD_CHANNEL_ID，无法在频道发送每周报告');
       }
 
-      await sendEmailReport('每周库存预警报告', report);
+      await sendEmailReport('每周供应链深度报告', report);
     } catch (err) {
       console.error('发送定时报告失败：', err.message);
     }
@@ -256,7 +320,7 @@ client.on('interactionCreate', async (interaction) => {
       const report = await generateSupplyReport();
       const embed = buildSupplyEmbed(report);
       await interaction.editReply({ embeds: [embed] });
-      console.log('已通过 /report 返回预警报告（Embed）');
+      console.log('已通过 /report 返回供应链深度报告（Embed）');
     } catch (err) {
       console.error('处理 /report 失败：', err.message);
       if (interaction.deferred) {

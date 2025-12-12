@@ -18,7 +18,7 @@ const commands = [
     .setDescription('测试 Bot 是否在线'),
   new SlashCommandBuilder()
     .setName('report')
-    .setDescription('生成当前供应链库存/交期预警报告'),
+    .setDescription('生成供应链全站深度报告（预警/订单/库存）'),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);

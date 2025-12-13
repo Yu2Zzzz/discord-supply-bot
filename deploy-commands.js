@@ -37,6 +37,15 @@ const commands = [
         .setDescription('Excel 文件，需包含物料编码、名称等列')
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('import-products')
+    .setDescription('批量导入产品（上传 Excel）')
+    .addAttachmentOption(option =>
+      option
+        .setName('file')
+        .setDescription('Excel 文件，需包含产品编码、名称等列')
+        .setRequired(true)
+    ),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);

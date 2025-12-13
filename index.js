@@ -437,6 +437,86 @@ async function importSuppliersFromExcel(attachmentUrl) {
   return summary;
 }
 
+// ========== 2.3 从 Excel 附件批量导入产品 ==========
+function normalizeProductRow(row = {}) {
+  const aliases = {
+    productCode: ['productcode', 'product_code', 'code', '编码', '产品编码', 'sku'],
+    name: ['name', '产品名称', '品名'],
+    unit: ['unit', '单位'],
+    price: ['price', '单价'],
+    category: ['category', '类目'],
+    status: ['status', '状态'],
+    remark: ['remark', '备注'],
+  };
+
+  const lowerRow = {};
+  for (const [k, v] of Object.entries(row)) {
+    lowerRow[String(k).toLowerCase().trim()] = v;
+  }
+
+  const result = {};
+  for (const [target, keys] of Object.entries(aliases)) {
+    for (const key of keys) {
+      if (lowerRow[key] !== undefined && lowerRow[key] !== null && lowerRow[key] !== '') {
+        result[target] = lowerRow[key];
+        break;
+      }
+    }
+  }
+
+  if (result.price !== undefined) {
+    const num = Number(result.price);
+    result.price = Number.isFinite(num) ? num : null;
+  }
+
+  return result;
+}
+
+async function importProductsFromExcel(attachmentUrl) {
+  const apiBase = resolveApiBase();
+  if (!apiBase) {
+    throw new Error('无法推断后端 API 基础地址，请配置 SUPPLY_BASE_URL 或 SUPPLY_API_URL');
+  }
+
+  const fileRes = await axios.get(attachmentUrl, { responseType: 'arraybuffer' });
+  const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error('Excel 文件没有工作表');
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+  if (!rows.length) throw new Error('Excel 中没有数据行');
+
+  const candidates = rows.map(normalizeProductRow).filter(r => r.productCode && r.name);
+  if (!candidates.length) throw new Error('未找到包含产品编码与名称的有效行，请确认表头/列名');
+
+  const authHeader = await getAuthHeader();
+  const summary = { total: candidates.length, success: 0, failed: 0, messages: [] };
+
+  for (const item of candidates) {
+    try {
+      await axios.post(`${apiBase}/products`, {
+        productCode: item.productCode,
+        name: item.name,
+        unit: item.unit || 'PCS',
+        price: item.price ?? null,
+        category: item.category || null,
+        status: item.status || 'active',
+        remark: item.remark || null,
+      }, { headers: { ...authHeader } });
+
+      summary.success += 1;
+      summary.messages.push(`✅ ${item.productCode} ${item.name}`);
+    } catch (err) {
+      summary.failed += 1;
+      const msg = err.response?.data?.message || err.message;
+      summary.messages.push(`❌ ${item.productCode || ''} ${item.name || ''} -> ${msg}`);
+      if (err.response && err.response.status === 401) resetToken();
+    }
+  }
+
+  return summary;
+}
+
 // ========== 2.2 从 Excel 附件批量导入物料 ==========
 function normalizeMaterialRow(row = {}) {
   const aliases = {
@@ -534,59 +614,6 @@ async function importMaterialsFromExcel(attachmentUrl) {
 // ========== 3. Bot 上线时 ==========
 client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
-
-  // 临时：在“表单格式”频道发送导入说明与模板（发送一次后可置顶并删除此块）
-  (async () => {
-    const FORM_CHANNEL_NAME = '表单格式'; // 目标频道名称
-    const FORM_CHANNEL_ID = process.env.FORM_CHANNEL_ID; // 可选，指定频道 ID 更稳
-    const materialTemplatePath = 'sample-materials.xlsx';
-    const supplierTemplatePath = 'sample-suppliers.xlsx';
-
-    try {
-      let targetChannel = null;
-
-      // 1) 优先用 env 指定的频道 ID
-      if (FORM_CHANNEL_ID) {
-        try {
-          const ch = await client.channels.fetch(FORM_CHANNEL_ID);
-          if (ch && ch.isTextBased && ch.isTextBased()) {
-            targetChannel = ch;
-          }
-        } catch (e) {
-          console.warn('按 FORM_CHANNEL_ID 获取频道失败：', e.message);
-        }
-      }
-
-      // 2) 否则遍历缓存按名称查找
-      if (!targetChannel) {
-        client.channels.cache.forEach((ch) => {
-          if (ch && ch.name === FORM_CHANNEL_NAME && ch.isTextBased && ch.isTextBased()) {
-            targetChannel = ch;
-          }
-        });
-      }
-
-      if (!targetChannel) {
-        console.warn(`未找到名为「${FORM_CHANNEL_NAME}」的频道，跳过发送模板消息`);
-        return;
-      }
-
-      const content =
-        'Excel 导入说明（/import-materials 与 /import-suppliers）：\n\n' +
-        '物料导入：必填 物料编码、物料名称；可选 规格、单位、单价、安全库存、交期、采购员、类目、状态。\n' +
-        '供应商导入：必填 供应商编码、供应商名称；可选 类目、付款方式、联系人、电话、邮箱、地址、状态。\n' +
-        '请确保文件为 Excel（xlsx），数据在首个工作表，表头包含必填列。';
-
-      await targetChannel.send({
-        content,
-        files: [materialTemplatePath, supplierTemplatePath],
-      });
-
-      console.log(`已在「${FORM_CHANNEL_NAME}」频道发送导入格式与模板`);
-    } catch (e) {
-      console.error('发送导入模板消息失败：', e.message);
-    }
-  })();
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件
   cron.schedule('0 0 9 * * 1', async () => {
     try {
@@ -687,6 +714,36 @@ client.on('interactionCreate', async (interaction) => {
       console.log('已完成 Excel 批量导入物料');
     } catch (err) {
       console.error('处理 /import-materials 失败：', err.message);
+      const content = `导入失败：${err.message || '未知错误'}`;
+      if (interaction.deferred) {
+        await interaction.editReply(content);
+      } else {
+        await interaction.reply({ content, ephemeral: true });
+      }
+    }
+  }
+
+  if (interaction.commandName === 'import-products') {
+    const attachment = interaction.options.getAttachment('file');
+    if (!attachment) {
+      await interaction.reply({ content: '请上传 Excel 文件（包含产品编码与名称）', ephemeral: true });
+      return;
+    }
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      const summary = await importProductsFromExcel(attachment.url);
+      const lines = [
+        `导入完成：成功 ${summary.success} 条，失败 ${summary.failed} 条，合计 ${summary.total} 条。`,
+      ];
+      for (const msg of summary.messages.slice(0, 20)) lines.push(msg);
+      if (summary.messages.length > 20) {
+        lines.push(`… 其余 ${summary.messages.length - 20} 条已省略`);
+      }
+      await interaction.editReply(lines.join('\n'));
+      console.log('已完成 Excel 批量导入产品');
+    } catch (err) {
+      console.error('处理 /import-products 失败：', err.message);
       const content = `导入失败：${err.message || '未知错误'}`;
       if (interaction.deferred) {
         await interaction.editReply(content);

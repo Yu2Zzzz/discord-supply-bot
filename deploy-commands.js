@@ -38,12 +38,12 @@ const commands = [
         .setRequired(true)
     ),
   new SlashCommandBuilder()
-    .setName('import-products')
-    .setDescription('批量导入产品（上传 Excel）')
+    .setName('import-bom')
+    .setDescription('批量导入 BOM（上传 ERP 导出的 BOM Excel）')
     .addAttachmentOption(option =>
       option
         .setName('file')
-        .setDescription('Excel 文件，需包含产品编码、名称等列')
+        .setDescription('ERP 导出的 BOM Excel，包含产品/物料/用量列')
         .setRequired(true)
     ),
 ].map(cmd => cmd.toJSON());

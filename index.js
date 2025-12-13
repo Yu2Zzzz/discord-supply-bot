@@ -67,6 +67,44 @@ function resolveApiBase() {
   return null;
 }
 
+// 编码/文本规整
+function cleanCode(val) {
+  return String(val || '').trim().replace(/\.0$/, '');
+}
+function cleanText(val) {
+  return String(val || '').trim();
+}
+
+// 通过编码获取或创建，并返回 id（物料/产品通用）
+async function getOrCreateByCode(apiBase, type, code, payload) {
+  const normCode = cleanCode(code);
+  const authHeader = await getAuthHeader();
+  const keyword = encodeURIComponent(normCode);
+  const url = `${apiBase}/${type}?page=1&pageSize=1&keyword=${keyword}`;
+  const res = await axios.get(url, { headers: { ...authHeader } }).catch(() => null);
+  const list = res?.data?.data?.list || res?.data?.list || res?.data || [];
+  if (Array.isArray(list) && list.length) {
+    return list[0].id || list[0].materialId || list[0].productId || list[0].product_id || list[0].material_id;
+  }
+
+  try {
+    const createRes = await axios.post(`${apiBase}/${type}`, {
+      ...payload,
+      materialCode: payload.materialCode || normCode,
+      productCode: payload.productCode || normCode,
+    }, { headers: { ...authHeader } });
+    return createRes.data?.data?.id || createRes.data?.id;
+  } catch (err) {
+    // 再查一遍，避免并发创建导致 409
+    const res2 = await axios.get(url, { headers: { ...authHeader } }).catch(() => null);
+    const list2 = res2?.data?.data?.list || res2?.data?.list || res2?.data || [];
+    if (Array.isArray(list2) && list2.length) {
+      return list2[0].id || list2[0].materialId || list2[0].productId || list2[0].product_id || list2[0].material_id;
+    }
+    throw err;
+  }
+}
+
 // ========== 邮件发送工具 ==========
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
@@ -611,6 +649,363 @@ async function importMaterialsFromExcel(attachmentUrl) {
   return summary;
 }
 
+// ========== 2.3 从 ERP BOM Excel 批量导入产品 + 物料 + BOM ==========
+const bomAliases = {
+  productCode: ['成品编码', '产品编码', '成品编号', '产品编号', '父件编码', '父项编码', '父项料号', '主件编码'],
+  productName: ['成品名称', '产品名称', '父件名称', '父项名称'],
+  materialCode: ['物料编码', '子件编码', '原料编码', '原料编号', '子项编码', '子件料号', '子件代码'],
+  materialName: ['物料名称', '子件名称', '原料名称', '子项名称'],
+  quantity: ['用量', '数量', '基本用量', '需求数量', '总数量', '数 量', '标准用量'],
+  unit: ['单位', '基本单位', '库存单位', '子件单位'],
+};
+
+function findColumnIndex(headers, keys) {
+  const hs = headers.map((h) => String(h || '').trim());
+  for (let i = 0; i < hs.length; i++) {
+    for (const k of keys) {
+      if (hs[i].includes(k)) return i;
+    }
+  }
+  return -1;
+}
+
+function parseBomSheet(sheet, filename = '', sheetName = '') {
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  if (!rows.length) return [];
+
+  // 找到包含“子件代码/物料编码”等关键列名的表头行
+  const keyHeaders = [...bomAliases.materialCode, '子件代码', '物料编码'];
+  let headerRowIdx = 0;
+  for (let r = 0; r < rows.length; r++) {
+    const line = rows[r].map((v) => String(v || '').trim());
+    if (line.some((cell) => keyHeaders.some((k) => cell.includes(k)))) {
+      headerRowIdx = r;
+      break;
+    }
+  }
+
+  const headers = rows[headerRowIdx].map((h) => String(h || '').trim());
+  const dataRows = rows.slice(headerRowIdx + 1);
+
+  let idxProductCode = findColumnIndex(headers, bomAliases.productCode);
+  let idxProductName = findColumnIndex(headers, bomAliases.productName);
+  let idxMaterialCode = findColumnIndex(headers, bomAliases.materialCode);
+  let idxMaterialName = findColumnIndex(headers, bomAliases.materialName);
+  let idxQty = findColumnIndex(headers, bomAliases.quantity);
+  let idxUnit = findColumnIndex(headers, bomAliases.unit);
+  let idxSpec = headers.indexOf('规格');
+  let idxLevel = headers.indexOf('层级');
+  let idxMaterialSpec = idxSpec;
+
+  // ERP 表头兜底：子件代码/子件名称/标准用量/子件单位
+  if (idxMaterialCode === -1 && headers.includes('子件代码')) idxMaterialCode = headers.indexOf('子件代码');
+  if (idxMaterialName === -1 && headers.includes('子件名称')) idxMaterialName = headers.indexOf('子件名称');
+  if (idxQty === -1 && headers.includes('标准用量')) idxQty = headers.indexOf('标准用量');
+  if (idxUnit === -1 && headers.includes('子件单位')) idxUnit = headers.indexOf('子件单位');
+  if (idxProductCode === -1 && headers.includes('产品编码')) idxProductCode = headers.indexOf('产品编码');
+  if (idxProductName === -1 && headers.includes('产品名称')) idxProductName = headers.indexOf('产品名称');
+  if (idxSpec === -1 && headers.includes('规格')) idxSpec = headers.indexOf('规格');
+
+  if (idxMaterialCode === -1 || idxQty === -1) {
+    throw new Error('无法识别关键列（物料编码/数量），请检查表头');
+  }
+
+  const fileCode = filename ? filename.split('.')[0].split(' ')[0] : '';
+  const sheetCode = sheetName ? sheetName.split(' ')[0] : '';
+  const productDefaults = {
+    code: cleanCode(fileCode || sheetCode || 'BOM-PRODUCT'),
+    name: sheetName || fileCode || 'BOM产品',
+  };
+
+  const getLevel = (row) => {
+    if (idxLevel !== -1) {
+      const v = String(row[idxLevel] || '').trim();
+      const n = parseInt(v, 10);
+      if (!Number.isNaN(n)) return n;
+    }
+    // 兼容层级值写在前几列（含“-”）
+    for (let i = 0; i < Math.min(6, row.length); i++) {
+      const v = String(row[i] || '').trim();
+      if (!v || v === '-') continue;
+      const n = parseInt(v, 10);
+      if (!Number.isNaN(n)) return n;
+    }
+    return null;
+  };
+
+  // 预先探测首个层级=1 的行，锁定产品编码/名称
+  const detectedProduct = { ...productDefaults };
+  for (const row of dataRows) {
+    const levelNum = getLevel(row);
+    if (!Number.isNaN(levelNum) && levelNum === 1) {
+      const pc1 = cleanCode(idxMaterialCode !== -1 ? row[idxMaterialCode] : '');
+      const pn1 = idxMaterialName !== -1 ? cleanText(row[idxMaterialName]) : '';
+      const pc2 = idxProductCode !== -1 ? cleanCode(row[idxProductCode]) : '';
+      const pn2 = idxProductName !== -1 ? cleanText(row[idxProductName]) : '';
+      if (pc1) detectedProduct.code = pc1;
+      if (pn1) detectedProduct.name = pn1;
+      if (pc2) detectedProduct.code = pc2;
+      if (pn2) detectedProduct.name = pn2;
+      break;
+    }
+  }
+
+  let currentProduct = { ...detectedProduct };
+  const levelTotals = { 1: 1 }; // 相对整机累计用量
+  const data = [];
+
+  for (const row of dataRows) {
+    let levelNum = getLevel(row);
+    if (levelNum === null) levelNum = 2; // 未标层级按子件
+
+    const materialCode = cleanCode(idxMaterialCode !== -1 ? row[idxMaterialCode] : '');
+
+    // 层级=1：父件，只更新当前产品
+    if (!Number.isNaN(levelNum) && levelNum === 1) {
+      if (materialCode) currentProduct.code = cleanCode(materialCode);
+      const mName = idxMaterialName !== -1 ? cleanText(row[idxMaterialName]) : '';
+      if (mName) currentProduct.name = mName;
+      const pc2 = idxProductCode !== -1 ? cleanCode(row[idxProductCode]) : '';
+      const pn2 = idxProductName !== -1 ? cleanText(row[idxProductName]) : '';
+      if (pc2) currentProduct.code = pc2;
+      if (pn2) currentProduct.name = pn2;
+      Object.keys(levelTotals).forEach((k) => delete levelTotals[k]);
+      levelTotals[1] = 1;
+      continue;
+    }
+
+    const qtyPerParent = Number(row[idxQty]) || 0;
+    if (!materialCode || qtyPerParent === 0) continue;
+
+    const parentLevel = levelNum > 1 ? levelNum - 1 : 1;
+    const parentTotal = levelTotals[parentLevel] || 1;
+    const qty = qtyPerParent * parentTotal;
+
+    // 更新累计用量
+    Object.keys(levelTotals)
+      .map((k) => parseInt(k, 10))
+      .filter((k) => k >= levelNum)
+      .forEach((k) => delete levelTotals[k]);
+    levelTotals[levelNum] = qty;
+
+    data.push({
+      productCode: currentProduct.code || productDefaults.code,
+      productName: currentProduct.name || productDefaults.name,
+      materialCode,
+      materialName: idxMaterialName !== -1 ? cleanText(row[idxMaterialName]) : materialCode,
+      spec: idxMaterialSpec !== -1 ? cleanText(row[idxMaterialSpec]) : '',
+      qty,
+      unit: idxUnit !== -1 ? cleanText(row[idxUnit]) || 'PCS' : 'PCS',
+    });
+  }
+  return data;
+}
+
+function uniqBy(arr, keyFn) {
+  const seen = new Set();
+  const res = [];
+  for (const item of arr) {
+    const k = keyFn(item);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    res.push(item);
+  }
+  return res;
+}
+
+async function importProductsAndMaterialsFromBom(attachmentUrl, filename = '') {
+  const apiBase = resolveApiBase();
+  if (!apiBase) throw new Error('无法推断后端 API 基础地址，请配置 SUPPLY_BASE_URL 或 SUPPLY_API_URL');
+
+  const fileRes = await axios.get(attachmentUrl, { responseType: 'arraybuffer' });
+  const workbook = XLSX.read(fileRes.data, { type: 'buffer' });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error('Excel 文件没有工作表');
+  const sheet = workbook.Sheets[sheetName];
+  const bomRows = parseBomSheet(sheet, filename, sheetName);
+  if (!bomRows.length) throw new Error('未解析到有效的 BOM 数据行');
+
+  const products = uniqBy(
+    bomRows.map((d) => ({
+      productCode: cleanCode(d.productCode),
+      name: d.productName || d.productCode,
+      unit: 'PCS',
+      price: null,
+      category: 'BOM导入',
+      status: 'active',
+    })),
+    (p) => p.productCode
+  );
+
+  const materials = uniqBy(
+    bomRows.map((d) => ({
+      materialCode: cleanCode(d.materialCode),
+      name: d.materialName || d.materialCode,
+      spec: d.spec || '',
+      unit: d.unit || 'PCS',
+      price: null,
+      safeStock: null,
+      leadTime: null,
+      category: 'BOM物料',
+      status: 'active',
+    })),
+    (m) => m.materialCode
+  );
+
+  const authHeader = await getAuthHeader();
+  const summary = {
+    products: { total: products.length, success: 0, failed: 0, messages: [] },
+    materials: { total: materials.length, success: 0, failed: 0, messages: [] },
+  };
+
+  const productIdMap = new Map();
+  const materialIdMap = new Map();
+
+  // 导入产品
+  for (const p of products) {
+    try {
+      const id = await getOrCreateByCode(apiBase, 'products', p.productCode, {
+        productCode: p.productCode,
+        name: p.name,
+        unit: p.unit,
+        price: p.price,
+        category: p.category,
+        status: p.status,
+      });
+      productIdMap.set(p.productCode, id);
+      summary.products.success += 1;
+      summary.products.messages.push(`✅ 产品 ${p.productCode} ${p.name}`);
+    } catch (err) {
+      summary.products.failed += 1;
+      const msg = err.response?.data?.message || err.message;
+      summary.products.messages.push(`❌ 产品 ${p.productCode} ${p.name} -> ${msg}`);
+      if (err.response?.status === 401) resetToken();
+    }
+  }
+
+  // 导入物料
+  for (const m of materials) {
+    try {
+      const id = await getOrCreateByCode(apiBase, 'materials', m.materialCode, {
+        materialCode: m.materialCode,
+        name: m.name,
+        spec: m.spec,
+        unit: m.unit,
+        price: m.price,
+        safeStock: m.safeStock,
+        leadTime: m.leadTime,
+        category: m.category,
+        status: m.status,
+      });
+      materialIdMap.set(m.materialCode, id);
+      summary.materials.success += 1;
+      summary.materials.messages.push(`✅ 物料 ${m.materialCode} ${m.name}`);
+    } catch (err) {
+      summary.materials.failed += 1;
+      const msg = err.response?.data?.message || err.message;
+      summary.materials.messages.push(`❌ 物料 ${m.materialCode} ${m.name} -> ${msg}`);
+      if (err.response?.status === 401) resetToken();
+    }
+  }
+
+  // 兜底：刷新一次物料列表，补全 code → id
+  try {
+    const resAll = await axios.get(`${apiBase}/materials?page=1&pageSize=2000`, { headers: { ...authHeader } });
+    const list = resAll?.data?.data?.list || resAll?.data?.list || [];
+    if (Array.isArray(list)) {
+      for (const m of list) {
+        const code = cleanCode(m.materialCode || m.material_code);
+        if (code && m.id) materialIdMap.set(code, m.id);
+      }
+    }
+  } catch (e) {
+    console.warn('拉取全量物料列表兜底失败：', e.message);
+  }
+
+  // 写入 BOM
+  for (const p of products) {
+    const pid = productIdMap.get(p.productCode);
+    if (!pid) continue;
+    const bomMap = new Map();
+    const missingCodes = new Set();
+    for (const r of bomRows.filter((r) => cleanCode(r.productCode) === p.productCode)) {
+      const codeKey = cleanCode(r.materialCode);
+      let mid = materialIdMap.get(codeKey);
+      if (!mid) {
+        const matInfo = materials.find((m) => cleanCode(m.materialCode) === codeKey);
+        const payload = matInfo ? {
+          materialCode: matInfo.materialCode,
+          name: matInfo.name,
+          spec: matInfo.spec,
+          unit: matInfo.unit,
+          price: matInfo.price,
+          safeStock: matInfo.safeStock,
+          leadTime: matInfo.leadTime,
+          category: matInfo.category,
+          status: matInfo.status,
+        } : {
+          materialCode: codeKey,
+          name: r.materialName || r.materialCode,
+          spec: r.spec || '',
+          unit: r.unit || 'PCS',
+          category: 'BOM物料',
+          status: 'active',
+        };
+        try {
+          mid = await getOrCreateByCode(apiBase, 'materials', codeKey, payload);
+          materialIdMap.set(codeKey, mid);
+        } catch (e) {
+          // 再尝试直接查询接口精确匹配编码
+          try {
+            const resFind = await axios.get(`${apiBase}/materials?keyword=${encodeURIComponent(codeKey)}&page=1&pageSize=5`, { headers: { ...authHeader } });
+            const list = resFind?.data?.data?.list || resFind?.data?.list || [];
+            const exact = list.find((m) => cleanCode(m.materialCode || m.material_code) === codeKey);
+            if (exact && exact.id) {
+              mid = exact.id;
+              materialIdMap.set(codeKey, mid);
+            } else {
+              missingCodes.add(codeKey || r.materialCode || '');
+              continue;
+            }
+          } catch (e2) {
+            missingCodes.add(codeKey || r.materialCode || '');
+            continue;
+          }
+        }
+      }
+      if (!mid) {
+        missingCodes.add(codeKey || r.materialCode || '');
+        continue;
+      }
+      const prev = bomMap.get(mid) || 0;
+      bomMap.set(mid, prev + (Number(r.qty) || 0));
+    }
+
+    const bomItems = Array.from(bomMap.entries())
+      .map(([materialId, quantity]) => ({ materialId, quantity }))
+      .filter((b) => b.materialId && b.quantity > 0);
+
+    if (!bomItems.length) continue;
+
+    try {
+      await axios.put(
+        `${apiBase}/products/${pid}/bom`,
+        { bomItems },
+        { headers: { ...authHeader } }
+      );
+      summary.products.messages.push(`✅ BOM 更新 ${p.productCode} (${bomItems.length} 条)`);
+      if (missingCodes.size) {
+        summary.products.messages.push(`⚠️ 未匹配物料: ${Array.from(missingCodes).join(', ')}`);
+      }
+    } catch (err) {
+      summary.products.messages.push(`❌ BOM 更新 ${p.productCode} -> ${err.response?.data?.message || err.message}`);
+      if (err.response?.status === 401) resetToken();
+    }
+  }
+
+  return summary;
+}
+
 // ========== 3. Bot 上线时 ==========
 client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
@@ -800,6 +1195,39 @@ client.on('interactionCreate', async (interaction) => {
       console.log('已完成 Excel 批量导入产品');
     } catch (err) {
       console.error('处理 /import-products 失败：', err.message);
+      const content = `导入失败：${err.message || '未知错误'}`;
+      if (interaction.deferred) {
+        await interaction.editReply(content);
+      } else {
+        await interaction.reply({ content, ephemeral: true });
+      }
+    }
+  }
+
+  if (interaction.commandName === 'import-bom') {
+    const attachment = interaction.options.getAttachment('file');
+    if (!attachment) {
+      await interaction.reply({ content: '请上传 ERP 导出的 BOM Excel（包含产品/物料编码、数量）', ephemeral: true });
+      return;
+    }
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+      const summary = await importProductsAndMaterialsFromBom(attachment.url, attachment.name);
+      const lines = [
+        `产品导入：成功 ${summary.products.success}，失败 ${summary.products.failed}，总计 ${summary.products.total}`,
+        `物料导入：成功 ${summary.materials.success}，失败 ${summary.materials.failed}，总计 ${summary.materials.total}`,
+      ];
+      for (const msg of summary.products.messages.slice(0, 12)) lines.push(msg);
+      for (const msg of summary.materials.messages.slice(0, 12)) lines.push(msg);
+      const more =
+        (summary.products.messages.length > 12 ? summary.products.messages.length - 12 : 0) +
+        (summary.materials.messages.length > 12 ? summary.materials.messages.length - 12 : 0);
+      if (more > 0) lines.push(`… 其余 ${more} 条已省略`);
+      await interaction.editReply(lines.join('\n'));
+      console.log('已完成 BOM 批量导入产品与物料');
+    } catch (err) {
+      console.error('处理 /import-bom 失败：', err.message);
       const content = `导入失败：${err.message || '未知错误'}`;
       if (interaction.deferred) {
         await interaction.editReply(content);

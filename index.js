@@ -614,6 +614,62 @@ async function importMaterialsFromExcel(attachmentUrl) {
 // ========== 3. Bot 上线时 ==========
 client.once('ready', () => {
   console.log(`已登录为 ${client.user.tag}`);
+
+  // 临时：在“表单格式”频道发送导入说明与模板（发送一次后可置顶并删除此块）
+  (async () => {
+    const FORM_CHANNEL_NAME = '导入表单格式'; // 目标频道名称
+    const FORM_CHANNEL_ID = process.env.FORM_CHANNEL_ID; // 可选，指定频道 ID 更稳
+    const materialTemplatePath = 'sample-materials.xlsx';
+    const supplierTemplatePath = 'sample-suppliers.xlsx';
+    const productTemplatePath = 'sample-products.xlsx';
+
+    try {
+      let targetChannel = null;
+
+      // 1) 优先用 env 指定的频道 ID
+      if (FORM_CHANNEL_ID) {
+        try {
+          const ch = await client.channels.fetch(FORM_CHANNEL_ID);
+          if (ch && ch.isTextBased && ch.isTextBased()) {
+            targetChannel = ch;
+          }
+        } catch (e) {
+          console.warn('按 FORM_CHANNEL_ID 获取频道失败：', e.message);
+        }
+      }
+
+      // 2) 否则遍历缓存按名称查找
+      if (!targetChannel) {
+        client.channels.cache.forEach((ch) => {
+          if (ch && ch.name === FORM_CHANNEL_NAME && ch.isTextBased && ch.isTextBased()) {
+            targetChannel = ch;
+          }
+        });
+      }
+
+      if (!targetChannel) {
+        console.warn(`未找到名为「${FORM_CHANNEL_NAME}」的频道，跳过发送模板消息`);
+        return;
+      }
+
+      const content =
+        'Excel 导入说明：/import-materials /import-suppliers /import-products\n\n' +
+        '物料：必填 物料编码、物料名称；可选 规格、单位、单价、安全库存、交期、采购员、类目、状态。\n' +
+        '供应商：必填 供应商编码、供应商名称；可选 类目、付款方式、联系人、电话、邮箱、地址、状态。\n' +
+        '产品：必填 产品编码、产品名称；可选 单位、单价、类目、状态、备注。\n' +
+        '文件需为 xlsx，数据在首个工作表，表头包含必填列。';
+
+      await targetChannel.send({
+        content,
+        files: [materialTemplatePath, supplierTemplatePath, productTemplatePath],
+      });
+
+      console.log(`已在「${FORM_CHANNEL_NAME}」频道发送导入格式与模板`);
+    } catch (e) {
+      console.error('发送导入模板消息失败：', e.message);
+    }
+  })();
+
   // 每周一早上 9 点（服务器时间）发送频道消息 + 邮件
   cron.schedule('0 0 9 * * 1', async () => {
     try {

@@ -295,6 +295,14 @@ async function generateSupplyReport() {
   const fullData = dashboard?.raw || null;
   const dataSummary = dashboard?.summary || null;
 
+  // ⚠️ LLM 调用限流：截断上下文，避免超出 6000 TPM
+  const truncatedAlerts = safeAlerts.slice(0, 50); // 预警最多 50 条
+  const truncatedDataStr = (() => {
+    const str = JSON.stringify(fullData || {}, null, 2);
+    if (str.length > 2000) return str.slice(0, 2000) + '\n...（截断）';
+    return str;
+  })();
+
   if (!process.env.GROQ_API_KEY) {
     let lines = ['【库存/交期预警（简易版，无 LLM）】'];
     if (dataSummary) {
@@ -322,10 +330,10 @@ async function generateSupplyReport() {
 
   const prompt = `
 你是供应链计划员。下面是从系统抓取到的全站业务数据（JSON 对象）：
-${JSON.stringify(fullData || {}, null, 2)}
+${truncatedDataStr}
 
 这里是预警列表（JSON 数组，可能为空表示没有预警）：
-${JSON.stringify(safeAlerts, null, 2)}
+${JSON.stringify(truncatedAlerts, null, 2)}
 
 请输出一份“全站深度解读报告”，要求：
 1. 总体概览：订单、物料、采购单、供应商等规模；按预警 level 给出数量。

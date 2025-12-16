@@ -1048,10 +1048,10 @@ client.once('ready', () => {
       }
 
       const content =
-        'Excel 导入说明：/import-materials /import-suppliers /import-products\n\n' +
+        'Excel 导入说明：/import-materials /import-suppliers /import-bom\n\n' +
         '物料：必填 物料编码、物料名称；可选 规格、单位、单价、安全库存、交期、采购员、类目、状态。\n' +
         '供应商：必填 供应商编码、供应商名称；可选 类目、付款方式、联系人、电话、邮箱、地址、状态。\n' +
-        '产品：必填 产品编码、产品名称；可选 单位、单价、类目、状态、备注。\n' +
+        'BOM：直接上传 ERP 导出的某个产品的 BOM（一个产品一张表），包含父件/子件编码、用量、单位等列，AI 会自动识别并导入产品、物料和 BOM。\n' +
         '文件需为 xlsx，数据在首个工作表，表头包含必填列。';
 
       await targetChannel.send({

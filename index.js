@@ -1016,7 +1016,6 @@ client.once('ready', () => {
     const FORM_CHANNEL_ID = process.env.FORM_CHANNEL_ID; // 可选，指定频道 ID 更稳
     const materialTemplatePath = 'sample-materials.xlsx';
     const supplierTemplatePath = 'sample-suppliers.xlsx';
-    const productTemplatePath = 'sample-products.xlsx';
 
     try {
       let targetChannel = null;
@@ -1056,7 +1055,7 @@ client.once('ready', () => {
 
       await targetChannel.send({
         content,
-        files: [materialTemplatePath, supplierTemplatePath, productTemplatePath],
+        files: [materialTemplatePath, supplierTemplatePath],
       });
 
       console.log(`已在「${FORM_CHANNEL_NAME}」频道发送导入格式与模板`);
